@@ -51,7 +51,7 @@ def test_column_missing_from_csv(tmp_path):
     assert "not in the CSV: body" in out
 
 
-def test_sending_is_not_built_yet():
+def test_real_run_needs_confirmation_when_not_interactive():
     code, out = run(["run", str(EXAMPLES / "posts.csv"), "-t", TEMPLATE], env={"DEMO_TOKEN": "x"})
     assert code == EXIT_USAGE
-    assert "--dry-run" in out
+    assert "--yes" in out
