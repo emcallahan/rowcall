@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,13 @@ version = "0.1.0"
 description = "Make one API call per row of a CSV file, safely: dry runs, rate limits, retries, and a results file."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+keywords = ["api", "csv", "bulk", "batch", "rest", "cli"]
 dependencies = ["PyYAML>=6.0", "requests>=2.31"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+demo = ["Pillow>=10"]
 
 [project.scripts]
 rowcall = "rowcall.cli:main"
