@@ -1,0 +1,14 @@
+# Creates one post per CSV row on JSONPlaceholder, a free fake API for testing.
+# Nothing is really saved there, so it is safe to try.
+#
+#   rowcall run examples/jsonplaceholder/posts.csv -t examples/jsonplaceholder/create-post.yaml --dry-run
+method: POST
+url: https://jsonplaceholder.typicode.com/posts
+headers:
+  # JSONPlaceholder ignores this header. It is here to show how secrets
+  # come from environment variables and are masked as **** in previews.
+  Authorization: Bearer ${DEMO_TOKEN}
+body:
+  userId: "{{user_id}}"
+  title: "{{title}}"
+  body: "{{body}}"
