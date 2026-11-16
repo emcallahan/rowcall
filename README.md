@@ -7,7 +7,7 @@ time. rowcall fills in a request template for each row, checks every row
 before anything is sent, asks before sending, and writes a results file you
 can open in a spreadsheet.
 
-> Status: early. Dry runs and sending work. Rate limiting and retries are next.
+> Status: feature-complete for version 1. A demo and first release are next.
 
 ## Try it
 
@@ -39,6 +39,28 @@ to send and where, and waits for you to type `yes` (or pass `--yes`).
 - **Results are written as each row finishes**, so if a run is interrupted you
   still know exactly which rows went through. Existing results files are never
   overwritten.
+- **It goes at a polite pace.** At most 5 requests per second by default
+  (`--rate`), retries included.
+- **It retries only when retrying cannot do something twice.** See below.
+- **Ctrl+C stops cleanly.** Every row still ends up in the results file: the
+  one in progress is marked `interrupted` (check whether it went through) and
+  the rest are marked `not_sent`.
+
+## Retries
+
+A failed request is retried (up to `--retries`, default 3) only when that is
+safe:
+
+| What happened | Retried? | Why |
+|---------------|----------|-----|
+| Could not reach the server | Always | The request never arrived |
+| `429 Too Many Requests` or `503 Unavailable` | Always | The server says it did nothing |
+| Timeout, dropped connection, `502`, `504` | Only GET, PUT, DELETE, HEAD, OPTIONS | The server may already have acted. Repeating these is harmless, but repeating a POST or PATCH could create duplicates |
+| Any other error (`400`, `401`, `404`, `500`, ...) | Never | Trying again will not change the answer |
+
+rowcall waits as long as the server's `Retry-After` header asks. Otherwise it
+waits 1s, 2s, 4s, and so on. If the server asks for a wait longer than
+`--max-wait` (default 60 seconds), rowcall gives up on that row and says why.
 
 ## Results file
 
@@ -47,11 +69,12 @@ Every input column, plus:
 | Column | Meaning |
 |--------|---------|
 | `rowcall_line` | line number in the input CSV |
-| `rowcall_outcome` | `sent_ok`, `sent_failed`, or `skipped` |
+| `rowcall_outcome` | `sent_ok`, `sent_failed`, `skipped`, `interrupted`, or `not_sent` |
 | `rowcall_status` | HTTP status code (blank if no response) |
 | `rowcall_error` | what went wrong, if anything |
 | `rowcall_response` | first 500 characters of the response |
-| `rowcall_ms` | how long the request took |
+| `rowcall_ms` | how long the last attempt took |
+| `rowcall_attempts` | how many times the request was sent |
 
 ## Templates
 
@@ -80,12 +103,13 @@ body:
 | 1 | some rows have problems, failed, or were skipped |
 | 2 | the template, CSV, or settings need fixing before anything can run |
 | 3 | you answered no at the confirmation prompt |
+| 130 | stopped with Ctrl+C |
 
 ## Roadmap
 
 1. [x] Templates and dry run
 2. [x] Send requests and write a results CSV
-3. [ ] Rate limiting, retries (honoring `Retry-After`), clean stop on Ctrl+C
+3. [x] Rate limiting, retries (honoring `Retry-After`), clean stop on Ctrl+C
 4. [ ] Demo GIF and a first release
 
 ## Later (not in version 1)

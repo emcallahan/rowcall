@@ -8,11 +8,12 @@ from typing import Iterable
 
 RESULT_COLUMNS = [
     "rowcall_line",
-    "rowcall_outcome",  # sent_ok, sent_failed, or skipped
+    "rowcall_outcome",  # sent_ok, sent_failed, skipped, interrupted, or not_sent
     "rowcall_status",
     "rowcall_error",
     "rowcall_response",
     "rowcall_ms",
+    "rowcall_attempts",
 ]
 
 RESPONSE_LIMIT = 500
@@ -40,6 +41,7 @@ class ResultsWriter:
         error: str = "",
         response: str = "",
         elapsed_ms: int | None = None,
+        attempts: int | None = None,
     ) -> None:
         self._writer.writerow(
             [values.get(c, "") for c in self.input_columns]
@@ -51,6 +53,7 @@ class ResultsWriter:
                 # Redact before cutting, so a secret is never left half-visible.
                 self.redact(_one_line(response))[:RESPONSE_LIMIT],
                 "" if elapsed_ms is None else elapsed_ms,
+                "" if attempts is None else attempts,
             ]
         )
         self._handle.flush()

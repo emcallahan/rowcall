@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,13 +17,15 @@ import requests
 from . import __version__
 from .csvio import CsvData, CsvError, Row, read_csv
 from .results import ResultsWriter
-from .sender import send
+from .retry import RateLimiter, RetryingSender, RetryPolicy
+from .sender import SendResult, send
 from .template import RenderedRequest, RequestTemplate, TemplateError, load_template, render
 
 EXIT_OK = 0
 EXIT_ROW_PROBLEMS = 1
 EXIT_USAGE = 2
 EXIT_CANCELLED = 3
+EXIT_INTERRUPTED = 130  # the usual exit code for a program stopped with Ctrl+C
 
 MAX_PROBLEMS_SHOWN = 10
 
@@ -69,6 +72,27 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long to wait for each response (default: 30)",
     )
+    run.add_argument(
+        "--rate",
+        type=float,
+        default=5.0,
+        metavar="PER_SECOND",
+        help="at most this many requests per second, retries included (default: 5, 0 = no limit)",
+    )
+    run.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help="retries per row when it is safe to retry (default: 3, 0 = never retry)",
+    )
+    run.add_argument(
+        "--max-wait",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="longest wait before one retry; give up if the server asks for longer (default: 60)",
+    )
     return parser
 
 
@@ -78,6 +102,8 @@ def main(
     out: TextIO | None = None,
     ask: Callable[[str], str] | None = None,
     interactive: bool | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    send_fn: Callable[..., SendResult] = send,
 ) -> int:
     out = out or sys.stdout
     env = os.environ if env is None else env
@@ -87,7 +113,7 @@ def main(
     args = build_parser().parse_args(argv)
 
     if args.command == "run":
-        return run_command(args, env, out, ask, interactive)
+        return run_command(args, env, out, ask, interactive, sleep, send_fn)
     return EXIT_USAGE
 
 
@@ -105,9 +131,15 @@ def run_command(
     out: TextIO,
     ask: Callable[[str], str],
     interactive: bool,
+    sleep: Callable[[float], None],
+    send_fn: Callable[..., SendResult],
 ) -> int:
     def say(line: str = "") -> None:
         print(line, file=out, flush=True)
+
+    if args.retries < 0 or args.rate < 0 or args.max_wait < 0 or args.timeout <= 0:
+        say("Error: --retries, --rate and --max-wait cannot be negative, and --timeout must be above 0.")
+        return EXIT_USAGE
 
     try:
         template = load_template(args.template)
@@ -164,6 +196,10 @@ def run_command(
     say(f"About to send {len(ready)} {template.method} request(s) to {target}.")
     if problems:
         say(f"{len(problems)} row(s) with problems will be skipped.")
+    if args.rate > 0:
+        minutes = len(ready) / args.rate / 60
+        estimate = f"about {minutes:.0f} minute(s)" if minutes >= 1 else "under a minute"
+        say(f"Pace: up to {args.rate:g} request(s) per second, {estimate} without retries.")
 
     if not args.yes:
         if not interactive:
@@ -184,38 +220,84 @@ def run_command(
         say(f"Error: cannot create {results_path}: {exc}")
         return EXIT_USAGE
 
-    sent_ok = sent_failed = 0
+    counts = {"sent_ok": 0, "sent_failed": 0, "interrupted": 0, "not_sent": 0}
     total = len(ready)
+    position = 0  # index into `checked` of the row being worked on
+    interrupted = False
+
     with writer, requests.Session() as session:
+
+        def on_retry(attempt: int, result: SendResult, delay: float) -> None:
+            reason = writer.redact(result.error)
+            say(f"      {reason}, retrying in {delay:g}s (retry {attempt} of {args.retries})")
+
+        sender = RetryingSender(
+            send_fn=lambda request: send_fn(request, session, args.timeout),
+            policy=RetryPolicy(max_retries=args.retries, max_wait=args.max_wait),
+            limiter=RateLimiter(args.rate, sleep=sleep),
+            sleep=sleep,
+            on_retry=on_retry,
+        )
+
         say()
         number = 0
-        for item in checked:
-            if item.problem:
-                writer.write(item.row.line, item.row.values, "skipped", error=item.problem)
-                continue
-            number += 1
-            result = send(item.request, session, args.timeout)
-            outcome = "sent_ok" if result.ok else "sent_failed"
-            writer.write(
-                item.row.line,
-                item.row.values,
-                outcome,
-                status=result.status,
-                error=result.error,
-                response=result.response_text,
-                elapsed_ms=result.elapsed_ms,
-            )
-            if result.ok:
-                sent_ok += 1
-                say(f"  [{number}/{total}] line {item.row.line}: {result.status} ({result.elapsed_ms} ms)")
-            else:
-                sent_failed += 1
-                say(f"  [{number}/{total}] line {item.row.line}: FAILED {writer.redact(result.error)}")
+        try:
+            for position, item in enumerate(checked):
+                if item.problem:
+                    writer.write(item.row.line, item.row.values, "skipped", error=item.problem)
+                    continue
+                number += 1
+                result, attempts = sender.send(item.request)
+                outcome = "sent_ok" if result.ok else "sent_failed"
+                counts[outcome] += 1
+                writer.write(
+                    item.row.line,
+                    item.row.values,
+                    outcome,
+                    status=result.status,
+                    error=result.error,
+                    response=result.response_text,
+                    elapsed_ms=result.elapsed_ms,
+                    attempts=attempts,
+                )
+                tries = f", {attempts} attempts" if attempts > 1 else ""
+                if result.ok:
+                    say(f"  [{number}/{total}] line {item.row.line}: {result.status} ({result.elapsed_ms} ms{tries})")
+                else:
+                    say(f"  [{number}/{total}] line {item.row.line}: FAILED {writer.redact(result.error)}{tries}")
+        except KeyboardInterrupt:
+            interrupted = True
+            current = checked[position]
+            if not current.problem:
+                if sender.attempted:
+                    counts["interrupted"] += 1
+                    writer.write(
+                        current.row.line,
+                        current.row.values,
+                        "interrupted",
+                        error="stopped while this request was in progress; check whether it went through",
+                    )
+                else:
+                    counts["not_sent"] += 1
+                    writer.write(current.row.line, current.row.values, "not_sent", error="stopped before sending")
+            for item in checked[position + 1 :]:
+                if item.problem:
+                    writer.write(item.row.line, item.row.values, "skipped", error=item.problem)
+                else:
+                    counts["not_sent"] += 1
+                    writer.write(item.row.line, item.row.values, "not_sent", error="stopped before sending")
 
     say()
-    say(f"Done: {sent_ok} succeeded, {sent_failed} failed, {len(problems)} skipped.")
+    if interrupted:
+        say("Stopped by Ctrl+C. Every row is in the results file, including the ones not sent.")
+    summary = f"{counts['sent_ok']} succeeded, {counts['sent_failed']} failed, {len(problems)} skipped"
+    if interrupted:
+        summary += f", {counts['interrupted']} interrupted, {counts['not_sent']} not sent"
+    say(f"Done: {summary}.")
     say(f"Results: {results_path}")
-    return EXIT_OK if sent_failed == 0 and not problems else EXIT_ROW_PROBLEMS
+    if interrupted:
+        return EXIT_INTERRUPTED
+    return EXIT_OK if counts["sent_failed"] == 0 and not problems else EXIT_ROW_PROBLEMS
 
 
 def check_rows(template: RequestTemplate, data: CsvData, env: Mapping[str, str]) -> list[CheckedRow]:
